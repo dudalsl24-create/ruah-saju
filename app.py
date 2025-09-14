@@ -6,11 +6,12 @@ import datetime
 
 # --- 초기 설정 ---
 # Gemini API 키 설정 (Streamlit Cloud 배포 버전)
+# Streamlit의 'Secrets'에 저장된 키를 안전하게 불러옵니다.
 try:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
 except Exception as e:
-    # 로컬 테스트용 직접 입력 방식: "YOUR_API_KEY"를 실제 키로 바꾸세요.
-    # genai.configure(api_key="AIzaSyBs9wVnliIm0g5fnOnNc1aqtUY_h5F-O5A")
+    # Secrets 설정이 안 되어 있을 경우, 화면에 안내 메시지를 표시합니다.
+    st.error("오류: Streamlit Cloud의 Secrets에 GOOGLE_API_KEY가 설정되지 않았습니다.")
     pass
 
 # --- 핵심 기능 및 AI 설정 ---
