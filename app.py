@@ -1,6 +1,7 @@
-# app.py
+# app.py 
 import streamlit as st
 from datetime import date
+import pandas as pd
 from saju_rules import get_pillars, five_element_counts
 
 st.set_page_config(page_title="사주명리코치 루아", page_icon="🔮")
@@ -9,10 +10,15 @@ st.title("🔮 사주명리코치 루아")
 # ─────────────────────────────────────────
 # 1) KASI API 키 (Secrets)
 # ─────────────────────────────────────────
-API_KEY = st.secrets.get("DATA_GO_KR_KEY")
-if not API_KEY:
-    st.error("DATA_GO_KR_KEY 가 없습니다. Streamlit Cloud → Settings → Secrets 에 추가하세요.")
-    st.stop()
+ API_KEY = st.secrets.get("DATA_GO_KR_KEY")
+ if not API_KEY:
+     st.error("DATA_GO_KR_KEY 가 없습니다. Streamlit Cloud → Settings → Secrets 에 추가하세요.")
+     st.stop()
++
++# 같은 입력에 대해 24시간 캐시
++@st.cache_data(ttl=60*60*24, show_spinner=False)
++def _pillars_cached(y, m, d, hh, mm, key):
++    return get_pillars(y, m, d, hh, mm, key)
 
 # ─────────────────────────────────────────
 # 2) 입력 UI (양력 + 2시간대)
@@ -48,7 +54,7 @@ time_label = st.selectbox("시간대", [c[0] for c in choices], index=5)
 if st.button("만세력 확인하기"):
     try:
         hh, mm = label_to_hm[time_label]
-        pillars = get_pillars(int(y), int(m), int(d), hh, mm, API_KEY)
+        pillars = _pillars_cached(int(y), int(m), int(d), hh, mm, API_KEY)
         # 표시
         st.success(f"{pillars['year_gz']}년 {pillars['month_gz']}월 {pillars['day_gz']}일 {pillars['time_gz']}시")
         if pillars["time_gz"].endswith("子"):
@@ -56,8 +62,10 @@ if st.button("만세력 확인하기"):
 
         # 오행 카운트
         cnt = five_element_counts(pillars)
-        st.bar_chart(cnt)
-        biggest = max(cnt, key=cnt.get)
+        df = pd.DataFrame({"오행": list(cnt.keys()), "개수": list(cnt.values())}).set_index("오행")
+        st.bar_chart(df)
+        biggest = df["개수"].idxmax()
         st.info(f"가장 많은 오행: {biggest}")
     except Exception as e:
         st.error(f"오류: {e}")
+
