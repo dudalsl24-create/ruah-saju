@@ -157,3 +157,7 @@ def get_pillars(y:int,m:int,d:int, hh:int,mm:int, is_lunar:bool=False)->Pillars:
     gh = _hour_by_shidu(dp[0], hbr)
     note = f"{'음력→양력, ' if is_lunar else ''}규칙식, {label}, +30분, 일자보정 {corr:+d}일"
     return Pillars(yp,mp,dp,gh,note)
+def get_pillars_by_textbook_rules(y, m, d, hh, mm, is_lunar=False):
+    # 기존 get_pillars의 래퍼(동일한 동작)
+    return get_pillars(y, m, d, hh, mm, is_lunar=is_lunar)
+
