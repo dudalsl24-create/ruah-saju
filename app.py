@@ -1,123 +1,182 @@
-# app.py — 사주명리코치 루아 (심플 UI / 2시간대 선택 / CSV 업로드 불필요)
-import os
-import streamlit as st
+# app.py — KASI 공공데이터(한국천문연)로 연/월/일 간지, 시주는 시두법 계산
+import os, urllib.parse, requests, json
+import xmltodict
 import pandas as pd
-
-# 필수: saju_rules에서 계산 함수 가져오기 (CSV는 sajupy 내장 DB 자동 사용)
-try:
-    from saju_rules import get_pillars, five_element_counts
-except Exception as e:
-    st.set_page_config(page_title="사주명리코치 루아", page_icon="🔮")
-    st.title("🔮 사주명리코치 루아")
-    st.error("saju_rules.py 불러오기 실패\n\n" + str(e))
-    st.stop()
+import streamlit as st
+from datetime import date, timedelta
 
 st.set_page_config(page_title="사주명리코치 루아", page_icon="🔮")
 st.title("🔮 사주명리코치 루아")
 st.markdown("---")
 
-# 사이드바(필요 최소)
-STYLE_TO_MAXTOK = {"짧게(≈150자)": 220, "보통(≈300자)": 420}
-with st.sidebar:
-    resp_style = st.radio("응답 길이", list(STYLE_TO_MAXTOK.keys()), index=0)
-    engine = st.selectbox("엔진", ["Mock", "Gemini"], index=0)
-    st.caption("Gemini 키가 없으면 Mock으로 자동 동작합니다.")
+# ===== 간지/오행 기본표 =====
+STEMS     = ['甲','乙','丙','丁','戊','己','庚','辛','壬','癸']
+BRANCHES  = ['子','丑','寅','卯','辰','巳','午','未','申','酉','戌','亥']
+HOUR_START_STEM_BY_DAY_STEM = {
+    '甲':'甲','己':'甲','乙':'丙','庚':'丙','丙':'戊','辛':'戊','丁':'庚','壬':'庚','戊':'壬','癸':'壬'
+}
+ELEM_GAN = {'甲':'목','乙':'목','丙':'화','丁':'화','戊':'토','己':'토','庚':'금','辛':'금','壬':'수','癸':'수'}
+ELEM_BRANCH = {'子':'수','丑':'토','寅':'목','卯':'목','辰':'토','巳':'화','午':'화','未':'토','申':'금','酉':'금','戌':'토','亥':'수'}
 
-# 2시간대(한국 표준 경계 +30분 적용)
+# ===== 시간대 선택(한국표준 +30분 기준) =====
 SLOTS = [
-    ("23:30–01:30 (子)", 0, 30),  ("01:30–03:30 (丑)", 2, 30),
-    ("03:30–05:30 (寅)", 4, 30),  ("05:30–07:30 (卯)", 6, 30),
-    ("07:30–09:30 (辰)", 8, 30),  ("09:30–11:30 (巳)",10, 30),
-    ("11:30–13:30 (午)",12, 30),  ("13:30–15:30 (未)",14, 30),
-    ("15:30–17:30 (申)",16, 30),  ("17:30–19:30 (酉)",18, 30),
-    ("19:30–21:30 (戌)",20, 30),  ("21:30–23:30 (亥)",22, 30),
+    ("23:30–01:30 (子)", 0,30), ("01:30–03:30 (丑)", 2,30), ("03:30–05:30 (寅)", 4,30), ("05:30–07:30 (卯)", 6,30),
+    ("07:30–09:30 (辰)", 8,30), ("09:30–11:30 (巳)",10,30), ("11:30–13:30 (午)",12,30), ("13:30–15:30 (未)",14,30),
+    ("15:30–17:30 (申)",16,30), ("17:30–19:30 (酉)",18,30), ("19:30–21:30 (戌)",20,30), ("21:30–23:30 (亥)",22,30),
 ]
 
-# 선택 시에만 Gemini 불러오도록 (없으면 Mock)
-def init_gemini():
-    import google.generativeai as genai
-    key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+# ===== 공공데이터 호출 유틸 =====
+BASE = "https://apis.data.go.kr/B090041/openapi/service/LrsrCldInfoService"
+
+def _kasi_key():
+    key = st.secrets.get("DATA_GO_KR_KEY") or os.getenv("DATA_GO_KR_KEY")
     if not key:
-        raise RuntimeError("GOOGLE_API_KEY가 없습니다.")
-    genai.configure(api_key=key)
-    model = genai.GenerativeModel(
-        "gemini-1.5-flash",
-        generation_config={"max_output_tokens": STYLE_TO_MAXTOK[resp_style], "temperature":0.6},
-        system_instruction="한국어로 간결하게. 핵심만. 목록 최대 3개."
-    )
-    return model.start_chat(history=[])
+        raise RuntimeError("DATA_GO_KR_KEY가 없습니다. Streamlit Secrets에 넣어주세요.")
+    return key
 
-# 세션 상태
-if "chat" not in st.session_state: st.session_state.chat = None
-if "pillars" not in st.session_state: st.session_state.pillars = None
-if "five" not in st.session_state: st.session_state.five = None
-if "messages" not in st.session_state: st.session_state.messages = []
+def _get_json(url, params):
+    """
+    _type=json 지원하면 JSON으로 받고,
+    아니면 XML을 받아서 dict로 변환합니다.
+    """
+    key = _kasi_key()
+    # Decoding키면 그대로, Encoding키면 그대로 넣어도 됩니다(요청 라이브러리가 인코딩 처리).
+    params = {**params, "serviceKey": key}
+    # 1) JSON 시도
+    try:
+        r = requests.get(url, params={**params, "_type":"json"}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        return ("json", data)
+    except Exception:
+        # 2) XML fallback
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = xmltodict.parse(r.text)
+        return ("xml", data)
 
-# 입력 폼
-with st.form(key="saju_form"):
+def _extract_item(tagged, flavor):
+    """
+    KASI 응답에서 item을 dict로 뽑아 key를 소문자화하여 반환.
+    flavor=json/xml
+    """
+    try:
+        if flavor == "json":
+            item = (tagged["response"]["body"]["items"]["item"])
+        else:
+            item = (tagged["response"]["body"]["items"]["item"])
+    except Exception as e:
+        raise RuntimeError(f"KASI 응답 파싱 실패: {e}\n원문: {str(tagged)[:400]}")
+
+    # XML일 때 OrderedDict → dict
+    if not isinstance(item, dict):
+        raise RuntimeError(f"KASI item 형식이 예상과 다릅니다: {type(item)}")
+
+    # key를 소문자로 통일
+    out = {k.lower(): (v.get("#text") if isinstance(v, dict) and "#text" in v else v) for k,v in item.items()}
+    return out
+
+def get_sol_ganji(y, m, d):
+    """양력 입력 → (년간지, 월간지, 일간지)와 부가정보 반환"""
+    url = f"{BASE}/getSolCalInfo"
+    flavor, raw = _get_json(url, {"solYear": y, "solMonth": f"{m:02d}", "solDay": f"{d:02d}"})
+    it = _extract_item(raw, flavor)
+    # 필드명이 API 버전에 따라 다를 수 있어 넓게 탐색
+    yg = it.get("secha") or it.get("ganjiyear") or it.get("ganji_year") or it.get("szyear")
+    mg = it.get("wolji") or it.get("ganjimonth") or it.get("ganji_month") or it.get("szmonth")
+    dg = it.get("iljin") or it.get("ganjiday") or it.get("ganji_day") or it.get("szday")
+    if not (yg and mg and dg):
+        raise RuntimeError(f"간지 필드를 찾지 못했습니다. 응답 확인 필요: {it}")
+    # 한글 '갑자' 형태로 올 수도 있어요 → 한자 10천간/12지지 조합일 때만 그대로 사용
+    return str(yg), str(mg), str(dg), it
+
+def get_lun_to_sol(lun_y, lun_m, lun_d, leap_yn=0):
+    """음력 입력 → 같은 날의 양력 날짜(년,월,일)와 간지들"""
+    url = f"{BASE}/getLunCalInfo"
+    flavor, raw = _get_json(url, {
+        "lunYear": lun_y, "lunMonth": f"{lun_m:02d}", "lunDay": f"{lun_d:02d}", "leapMonth": int(leap_yn)
+    })
+    it = _extract_item(raw, flavor)
+    sy = int(it.get("solyear") or it.get("syear"))
+    sm = int(it.get("solmonth") or it.get("smonth"))
+    sd = int(it.get("solday") or it.get("sday"))
+    return sy, sm, sd, it
+
+# ===== 시두법(+30분/야·조자시) =====
+def hour_branch_and_day_correction(hh:int, mm:int):
+    """
+    한국표준 +30분 경계. 자시(23:30~01:30)는 야/조자시를 구분하여
+    야자시(23:30~00:30)는 '전날' 일간지로 계산해야 하므로 corr=-1.
+    """
+    local = hh*60 + mm
+    kst   = (local + 30) % (24*60)
+    if kst >= 23*60 or kst < 60:  # 子
+        label = "야자시" if local < 30 else "조자시"
+        corr  = -1 if local < 30 else 0
+        return '子', label, corr
+    bands=[('丑',90),('寅',210),('卯',330),('辰',450),('巳',570),
+           ('午',690),('未',810),('申',930),('酉',1050),('戌',1170),('亥',1290)]
+    for br,stt in bands:
+        if stt <= kst < stt+120:
+            return br,"일반",0
+    return '亥',"일반",0
+
+def hour_stem(day_stem:str, hour_branch:str):
+    start = HOUR_START_STEM_BY_DAY_STEM[day_stem]
+    order = ['子','丑','寅','卯','辰','巳','午','未','申','酉','戌','亥']
+    stem  = STEMS[(STEMS.index(start)+order.index(hour_branch))%10]
+    return stem
+
+def five_counts(gy, gm, gd, gh):
+    c={"목":0,"화":0,"토":0,"금":0,"수":0}
+    for p in [gy,gm,gd,gh]:
+        c[ELEM_GAN[p[0]]] += 1
+        c[ELEM_BRANCH[p[1]]] += 1
+    return c
+
+# ===== UI =====
+with st.form("frm"):
     c1,c2,c3 = st.columns(3)
     y = c1.number_input("연도", 1901, 2099, 1971)
     m = c2.number_input("월", 1, 12, 7)
     d = c3.number_input("일", 1, 31, 7)
-    cal = st.radio("달력", ["양력","음력"], horizontal=True, index=0)
-    slot_label = st.selectbox("시간대", [s[0] for s in SLOTS], index=11)
+    cal = st.radio("달력", ["양력","음력"], horizontal=True)
+    slot = st.selectbox("시간대", [s[0] for s in SLOTS], index=4)  # 07:30–09:30 기본
     ok = st.form_submit_button("만세력 확인하기")
 
 if ok:
-    hh, mm = next((h,mn) for label,h,mn in SLOTS if label == slot_label)
-    is_lunar = (cal == "음력")
-    # 핵심: CSV 없이도 sajupy 내장 DB 자동 사용 (saju_rules.py가 처리)
-    p = get_pillars(int(y), int(m), int(d), int(hh), int(mm), is_lunar=is_lunar)
-    st.session_state.pillars = p
-    st.session_state.five = five_element_counts(p.year, p.month, p.day, p.hour)
+    try:
+        # 1) 날짜 기준(양/음력) 정리
+        if cal == "음력":
+            sy, sm, sd, _ = get_lun_to_sol(int(y), int(m), int(d), leap_yn=0)
+        else:
+            sy, sm, sd = int(y), int(m), int(d)
 
-    intro = f"{p.year}년 {p.month}월 {p.day}일 {p.hour}시\n핵심 3줄, 실행 1, 다음 질문 1."
-    if engine == "Gemini":
-        try:
-            if not st.session_state.chat:
-                st.session_state.chat = init_gemini()
-            res = st.session_state.chat.send_message(intro)
-            st.session_state.messages = [{"role":"assistant","content":res.text}]
-        except Exception as e:
-            st.warning(f"Gemini 사용 불가: {e} → Mock으로 전환")
-            st.session_state.chat = None
-            st.session_state.messages = [{"role":"assistant","content":"요약 3줄·실행 1·다음 질문 1"}]
-    else:
-        st.session_state.messages = [{"role":"assistant","content":"요약 3줄·실행 1·다음 질문 1"}]
-    st.rerun()
+        # 2) 연/월/일 간지: KASI 공식값
+        y_g, m_g, d_g, _ = get_sol_ganji(sy, sm, sd)
 
-# 결과 영역
-if st.session_state.pillars:
-    p = st.session_state.pillars
-    st.success(f"{p.year}년 {p.month}월 {p.day}일 {p.hour}시")
-    if st.session_state.five:
-        col1, col2 = st.columns([2,1])
+        # 3) 시지/일간 보정(야자시면 하루 전 일간 사용)
+        hh, mm = next((h, mn) for label, h, mn in SLOTS if label == slot)
+        h_branch, h_label, corr = hour_branch_and_day_correction(hh, mm)
+        if corr == -1:
+            prev = date(sy, sm, sd) + timedelta(days=-1)
+            _, _, d_g, _ = get_sol_ganji(prev.year, prev.month, prev.day)
+
+        h_stem = hour_stem(d_g[0], h_branch)
+        h_g    = h_stem + h_branch
+
+        # 4) 결과 표시
+        st.success(f"{y_g}년 {m_g}월 {d_g}일 {h_g}시")
+        st.caption(f"{'음력→양력 변환, ' if cal=='음력' else ''}{h_label}(+30분), 일자보정 {corr:+d}일")
+
+        # 5) 오행 카운트
+        counts = five_counts(y_g, m_g, d_g, h_g)
+        col1,col2 = st.columns([2,1])
         with col1:
-            st.bar_chart(pd.DataFrame.from_dict(st.session_state.five, orient="index", columns=["개수"]))
+            st.bar_chart(pd.DataFrame.from_dict(counts, orient="index", columns=["개수"]))
         with col2:
-            top = max(st.session_state.five, key=st.session_state.five.get)
+            top = max(counts, key=counts.get)
             st.info(f"가장 많은 오행: **{top}**")
 
-# 채팅
-if st.session_state.messages:
-    for m in st.session_state.messages[-10:]:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
-    if q := st.chat_input("질문 입력"):
-        with st.chat_message("user"): st.markdown(q)
-        if st.session_state.chat:
-            try:
-                res = st.session_state.chat.send_message(
-                    f"{st.session_state.pillars.year}년 {st.session_state.pillars.month}월 "
-                    f"{st.session_state.pillars.day}일 {st.session_state.pillars.hour}시\n{q}"
-                )
-                out = res.text
-            except Exception as e:
-                st.warning(f"Gemini 오류: {e} → Mock으로 전환")
-                st.session_state.chat = None
-                out = "요약 3줄·실행 1·다음 질문 1"
-        else:
-            out = "요약 3줄·실행 1·다음 질문 1"
-        with st.chat_message("assistant"): st.markdown(out)
-        st.session_state.messages.append({"role":"user","content":q})
-        st.session_state.messages.append({"role":"assistant","content":out})
+    except Exception as e:
+        st.error(f"오류: {e}")
