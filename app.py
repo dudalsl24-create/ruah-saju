@@ -1,4 +1,16 @@
 # app.py — KASI 공공데이터(한국천문연)로 연/월/일 간지, 시주는 시두법 계산
+# 속도/안정화: 세션 + 재시도 + 짧은 타임아웃
+import requests, json, xmltodict
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+SESSION = requests.Session()
+SESSION.headers.update({"Accept": "application/json"})
+SESSION.mount("https://", HTTPAdapter(max_retries=Retry(
+    total=2, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504]
+)))
+DEFAULT_TIMEOUT = (3.5, 6.0)  # (connect, read) seconds
+
 import os, urllib.parse, requests, json
 import xmltodict
 import pandas as pd
@@ -35,23 +47,21 @@ def _kasi_key():
     return key
 
 def _get_json(url, params):
-    """
-    _type=json 지원하면 JSON으로 받고,
-    아니면 XML을 받아서 dict로 변환합니다.
-    """
-    key = _kasi_key()
-    # Decoding키면 그대로, Encoding키면 그대로 넣어도 됩니다(요청 라이브러리가 인코딩 처리).
-    params = {**params, "serviceKey": key}
-    # 1) JSON 시도
+    """KASI: JSON 우선, 실패 시 같은 응답을 XML로 파싱. 6초 내 실패."""
+    key = st.secrets.get("DATA_GO_KR_KEY") or os.getenv("DATA_GO_KR_KEY")
+    if not key:
+        raise RuntimeError("DATA_GO_KR_KEY가 없습니다. Secrets에 저장해 주세요.")
+    params = {**params, "serviceKey": key, "_type": "json"}
+
+    r = SESSION.get(url, params=params, timeout=DEFAULT_TIMEOUT)
+    r.raise_for_status()
+
+    # JSON 먼저 시도
     try:
-        r = requests.get(url, params={**params, "_type":"json"}, timeout=10)
-        r.raise_for_status()
         data = r.json()
         return ("json", data)
     except Exception:
-        # 2) XML fallback
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
+        # 같은 응답을 XML로 파싱 (네트워크 추가 호출 없음)
         data = xmltodict.parse(r.text)
         return ("xml", data)
 
@@ -89,6 +99,14 @@ def get_sol_ganji(y, m, d):
         raise RuntimeError(f"간지 필드를 찾지 못했습니다. 응답 확인 필요: {it}")
     # 한글 '갑자' 형태로 올 수도 있어요 → 한자 10천간/12지지 조합일 때만 그대로 사용
     return str(yg), str(mg), str(dg), it
+
+@st.cache_data(show_spinner=False, ttl=60*60*24)
+def get_sol_ganji(y, m, d):
+    # (함수 본문 그대로)
+
+@st.cache_data(show_spinner=False, ttl=60*60*24)
+def get_lun_to_sol(lun_y, lun_m, lun_d, leap_yn=0):
+    # (함수 본문 그대로)
 
 def get_lun_to_sol(lun_y, lun_m, lun_d, leap_yn=0):
     """음력 입력 → 같은 날의 양력 날짜(년,월,일)와 간지들"""
@@ -133,6 +151,8 @@ def five_counts(gy, gm, gd, gh):
         c[ELEM_GAN[p[0]]] += 1
         c[ELEM_BRANCH[p[1]]] += 1
     return c
+with st.spinner("공공데이터 조회 중…"):
+    y_g, m_g, d_g, _ = get_sol_ganji(sy, sm, sd)
 
 # ===== UI =====
 with st.form("frm"):
@@ -180,3 +200,4 @@ if ok:
 
     except Exception as e:
         st.error(f"오류: {e}")
+
