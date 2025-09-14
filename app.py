@@ -1,14 +1,120 @@
-# app.py — 사주 챗봇(저비용) + 만세력 변환 블록 내장 + Gemini/Mock
+# app.py — 사주 챗봇 + 만세력 변환 블록 내장 + 루아 /Mock
 import streamlit as st
-st.set_page_config(page_title="사주 챗봇(저비용)", page_icon="🔮")
+st.set_page_config(page_title="사주명리코치 루아", page_icon="🔮")
 
-import os, io, gzip, datetime, pathlib
+import os, io, gzip, datetime, pathlib, re
 import google.generativeai as genai
+
+# === sajupy 자동 감지 ===
+USE_SAJUPY = False
+try:
+    from sajupy.saju import get_saju_str as sj_get_saju_str
+    USE_SAJUPY = True
+except Exception:
+    USE_SAJUPY = False
+
+SAJU_ENGINE = "sajupy" if USE_SAJUPY else "fallback"
+
+# === 만세력 파싱/오행 계산 ===
+import re
+
+CHEONGAN = {'甲':'목','乙':'목','丙':'화','丁':'화','戊':'토','己':'토','庚':'금','辛':'금','壬':'수','癸':'수'}
+JIJI     = {'子':'수','丑':'토','寅':'목','卯':'목','辰':'토','巳':'화','午':'화','未':'토','申':'금','酉':'금','戌':'토','亥':'수'}
+
+def parse_ganji_4pillars(saju_text:str):
+    # 예: "己亥년 丙子월 庚辰일 丁丑시" → ('己亥','丙子','庚辰','丁丑')
+    m = re.search(r'([\u4E00-\u9FFF]{2})년\s+([\u4E00-\u9FFF]{2})월\s+([\u4E00-\u9FFF]{2})일\s+([\u4E00-\u9FFF]{2})시', saju_text)
+    if not m:
+        return ("","","","")
+    return m.group(1), m.group(2), m.group(3), m.group(4)
+
+def count_five_elements(gy, gm, gd, gt):
+    counts = {"목":0,"화":0,"토":0,"금":0,"수":0}
+    for p in [gy, gm, gd, gt]:
+        if not p: continue
+        tg, dz = p[0], p[1]
+        if tg in CHEONGAN: counts[CHEONGAN[tg]] += 1
+        if dz in JIJI:     counts[JIJI[dz]]     += 1
+    return counts
+
+def compute_and_store_saju(y, m, d, h, gender, is_lunar):
+    """
+    sajupy가 설치되어 있으면 sj_get_saju_str 사용.
+    결과를 session_state에 저장해서 UI에서 바로 표시.
+    """
+    try:
+        if USE_SAJUPY:
+            saju_text = sj_get_saju_str(y, m, d, h, gender, is_lunar)
+        else:
+            # 내부 변환 함수가 없으면 이 분기에는 오지 않습니다.
+            raise RuntimeError("sajupy 미설치 및 내부 변환기 없음")
+    except Exception as e:
+        cal = "음력" if is_lunar else "양력"
+        st.session_state.initial_saju = f"{cal} {y}-{m:02d}-{d:02d} {h:02d}시 / 성별:{'남' if '남' in gender else '여'} (계산 실패: {e})"
+        st.session_state.ganji = ("","","","")
+        st.session_state.five = None
+        st.session_state.saju_engine = SAJU_ENGINE
+        return
+
+    gy, gm, gd, gt = parse_ganji_4pillars(saju_text)
+    st.session_state.initial_saju = saju_text
+    st.session_state.ganji = (gy, gm, gd, gt)
+    st.session_state.five = count_five_elements(gy, gm, gd, gt)
+    st.session_state.saju_engine = SAJU_ENGINE
+# === 세션 기본값 ===
+if "initial_saju" not in st.session_state: st.session_state.initial_saju = ""
+if "ganji" not in st.session_state: st.session_state.ganji = ("","","","")
+if "five" not in st.session_state: st.session_state.five = None
+
+# === 상단: 현재 만세력 상태 표시 ===
+if st.session_state.initial_saju:
+    st.success(f"만세력: {st.session_state.initial_saju}")
+    st.caption(f"계산 엔진: {st.session_state.get('saju_engine','-')}")
+
+    if st.session_state.five:
+        import pandas as pd
+        col1, col2 = st.columns([2,1])
+        with col1:
+            st.bar_chart(pd.DataFrame.from_dict(st.session_state.five, orient="index", columns=["개수"]))
+        with col2:
+            dom = max(st.session_state.five, key=st.session_state.five.get)
+            st.info(f"가장 많은 오행: **{dom}**\n\n{st.session_state.five}")
+
+# === 입력 폼 (기본값을 1971-07-07 21시로 제공: 해시 테스트 용) ===
+with st.form("saju_form"):
+    st.write("먼저 생년월일시를 입력하세요 (1971-07-07 해시 테스트 가능)")
+    cal = st.radio("달력", ["양력","음력"], horizontal=True, index=0)
+    is_lunar = (cal == "음력")
+    today = datetime.datetime.now()
+    c1,c2,c3 = st.columns(3)
+    with c1: y = st.number_input("연도", 1901, today.year-1, 1971)
+    with c2: m = st.number_input("월", 1, 12, 7)
+    with c3: d = st.number_input("일", 1, 31, 7)
+    c4,c5 = st.columns(2)
+    with c4: h = st.selectbox("시간", list(range(24)), index=21, format_func=lambda x:f"{x:02d}시")
+    with c5: gender = st.radio("성별", ["남","여"], horizontal=True, index=0)
+    ok = st.form_submit_button("만세력 확인하기")
+
+if ok:
+    gender_map = "남자" if gender == "남" else "여자"
+    compute_and_store_saju(y, m, d, h, gender_map, is_lunar)
+    st.rerun()
+
+
+st.title("🔮 사주명리코치 루아")
+st.markdown("---")
+
+# 상단: 계산된 만세력 표시 + 엔진 표기
+if st.session_state.get("initial_saju"):
+    st.success(f"만세력: {st.session_state.initial_saju}")
+    st.caption(f"계산 엔진: {SAJU_ENGINE}")
 
 # ===== 비용 절감 옵션 =====
 STYLE_TO_MAXTOK = {"짧게(≈150자)": 220, "보통(≈300자)": 420}
-SYS_KO = ("당신은 사주 기반 코치입니다. 한국어로, 군더더기 없이 핵심만 말하세요. "
-          "리스트는 최대 3개, 문장은 짧게. 불필요한 인사/중복 금지.")
+SYS_KO = (
+    "당신은 사주 기반 코치입니다. 한국어로, 군더더기 없이 핵심만 말하세요. "
+    "리스트는 최대 3개, 문장은 짧게. 불필요한 인사/중복 금지."
+)
 
 # ===== 사이드바 =====
 st.sidebar.header("설정")
